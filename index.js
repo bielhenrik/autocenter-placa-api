@@ -33,72 +33,94 @@ app.get('/placa/:placa', async (req, res) => {
   }
 });
 
-// Busca NF-e pela chave de acesso - tenta varios formatos de endpoint
+// Busca NF-e pela chave de acesso via Meu Danfe API v2
+// Passo 1: PUT /fd/add/{chave} - adiciona na conta (R$0,03)
+// Passo 2: GET /fd/get/xml/{chave} - baixa o XML (gratis)
 app.get('/buscar-nf/:chave', async (req, res) => {
   const chave = (req.params.chave || '').replace(/[^0-9]/g, '');
   if (chave.length !== 44) return res.status(400).json({ error: 'Chave invalida (deve ter 44 digitos).' });
 
   const apiKey = process.env.MEUDANFE_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'MEUDANFE_KEY nao configurada.' });
+  if (!apiKey) return res.status(500).json({ error: 'MEUDANFE_KEY nao configurada no servidor.' });
 
-  // Endpoints para tentar em ordem
-  const tentativas = [
-    // Formato 1: POST com chave no body (texto)
-    { method: 'POST', url: `https://ws.meudanfe.com/api/v1/get/nfe/chave/${apiKey}`, body: chave, ct: 'text/plain' },
-    // Formato 2: POST com JSON
-    { method: 'POST', url: `https://ws.meudanfe.com/api/v1/get/nfe/${apiKey}`, body: JSON.stringify({ chave }), ct: 'application/json' },
-    // Formato 3: GET com chave na URL
-    { method: 'GET', url: `https://ws.meudanfe.com/api/v1/get/nfe/xml/${apiKey}/${chave}`, body: null, ct: null },
-    // Formato 4: POST corpo chave
-    { method: 'POST', url: `https://ws.meudanfe.com/api/v1/nfe/chave/${apiKey}`, body: chave, ct: 'text/plain' },
-  ];
+  const BASE = 'https://api.meudanfe.com.br/v2';
+  const headers = {
+    'Authorization': `Bearer ${apiKey}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json, text/xml, application/xml, */*'
+  };
 
-  let ultimoErro = '';
-  for (const t of tentativas) {
-    try {
-      const opts = { method: t.method, headers: { Accept: 'text/xml,application/xml,application/json,*/*' }, signal: AbortSignal.timeout(12000) };
-      if (t.body) { opts.body = t.body; opts.headers['Content-Type'] = t.ct; }
-      console.log(`[NF] Tentando: ${t.method} ${t.url}`);
-      const r = await fetch(t.url, opts);
-      const text = await r.text();
-      console.log(`[NF] Status: ${r.status} | Resposta: ${text.slice(0, 100)}`);
+  try {
+    // Passo 1: adicionar/buscar NF-e pela chave (cobra R$0,03 se nao estiver na conta)
+    console.log('[NF] Passo 1 - PUT /fd/add/' + chave.slice(0,10) + '...');
+    const r1 = await fetch(`${BASE}/fd/add/${chave}`, {
+      method: 'PUT',
+      headers,
+      signal: AbortSignal.timeout(20000)
+    });
+    const t1 = await r1.text();
+    console.log('[NF] Passo 1 status:', r1.status, '| resp:', t1.slice(0, 120));
 
-      if (!r.ok) { ultimoErro = `${r.status}: ${text.slice(0, 150)}`; continue; }
-
-      // Retornou XML
-      if (text.trim().startsWith('<')) {
-        res.set('Content-Type', 'application/xml');
-        return res.send(text);
-      }
-      // Retornou JSON com XML dentro
-      try {
-        const json = JSON.parse(text);
-        const xml = json.xml || json.nfe?.xml || json.xmlNFe || json.data?.xml || json.conteudo;
-        if (xml && xml.trim().startsWith('<')) {
-          res.set('Content-Type', 'application/xml');
-          return res.send(xml);
-        }
-        // JSON sem XML - pode ser resposta de sucesso com dados
-        if (json.error || json.mensagem) { ultimoErro = json.error || json.mensagem; continue; }
-        return res.json(json);
-      } catch {
-        ultimoErro = `Resposta inesperada: ${text.slice(0, 150)}`;
-        continue;
-      }
-    } catch (e) {
-      ultimoErro = e.message;
-      console.log(`[NF] Erro na tentativa: ${e.message}`);
+    if (!r1.ok && r1.status !== 409) {
+      // 409 = ja existe na conta (tudo certo, pode ir para o passo 2)
+      let msg = t1;
+      try { msg = JSON.parse(t1).message || JSON.parse(t1).error || t1; } catch {}
+      return res.status(r1.status).json({ error: 'Erro ao adicionar NF-e: ' + msg });
     }
-  }
 
-  // Nenhuma funcionou - retorna erro detalhado para debug
-  res.status(400).json({
-    error: 'Nenhum endpoint funcionou. Ultimo erro: ' + ultimoErro,
-    dica: 'Verifique a documentacao da API em web.meudanfe.com.br e informe o endpoint correto.'
-  });
+    // Passo 2: baixar o XML (gratis)
+    console.log('[NF] Passo 2 - GET /fd/get/xml/' + chave.slice(0,10) + '...');
+    const r2 = await fetch(`${BASE}/fd/get/xml/${chave}`, {
+      method: 'GET',
+      headers,
+      signal: AbortSignal.timeout(15000)
+    });
+    const t2 = await r2.text();
+    console.log('[NF] Passo 2 status:', r2.status, '| inicio:', t2.slice(0, 80));
+
+    if (!r2.ok) {
+      let msg = t2;
+      try { msg = JSON.parse(t2).message || JSON.parse(t2).error || t2; } catch {}
+      return res.status(r2.status).json({ error: 'Erro ao baixar XML: ' + msg });
+    }
+
+    // Retornou XML direto
+    if (t2.trim().startsWith('<')) {
+      res.set('Content-Type', 'application/xml; charset=utf-8');
+      return res.send(t2);
+    }
+
+    // Retornou JSON com XML ou base64 dentro
+    try {
+      const json = JSON.parse(t2);
+      const xml = json.xml || json.xmlNFe || json.conteudo || json.data;
+      if (xml && String(xml).trim().startsWith('<')) {
+        res.set('Content-Type', 'application/xml; charset=utf-8');
+        return res.send(xml);
+      }
+      // Pode estar em base64
+      if (xml) {
+        try {
+          const decoded = Buffer.from(xml, 'base64').toString('utf-8');
+          if (decoded.trim().startsWith('<')) {
+            res.set('Content-Type', 'application/xml; charset=utf-8');
+            return res.send(decoded);
+          }
+        } catch {}
+      }
+      return res.status(400).json({ error: 'Formato inesperado', detalhe: t2.slice(0, 300) });
+    } catch {
+      return res.status(400).json({ error: 'Resposta invalida do servidor', detalhe: t2.slice(0, 300) });
+    }
+
+  } catch (e) {
+    console.error('[NF] Erro:', e.message);
+    if (e.name === 'TimeoutError') return res.status(504).json({ error: 'Timeout (20s) - tente novamente' });
+    res.status(500).json({ error: e.message });
+  }
 });
 
-// Proxy Claude Vision
+// Proxy Claude Vision para leitura de NF por foto/PDF
 app.post('/ler-nf', async (req, res) => {
   const { base64, mimeType } = req.body;
   if (!base64 || !mimeType) return res.status(400).json({ error: 'base64 e mimeType sao obrigatorios' });
