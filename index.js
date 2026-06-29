@@ -81,16 +81,55 @@ app.get('/buscar-nf/:chave', async (req, res) => {
     console.log('[NF] GET /fd/get/xml/' + chave.slice(0,10) + '...');
     const r2 = await fetch(`${BASE}/fd/get/xml/${chave}`, {
       method: 'GET',
-      headers: { 'Api-Key': apiKey, 'Accept': 'text/xml, application/xml, */*' },
+      headers: { 'Api-Key': apiKey, 'Accept': 'application/json, text/xml, */*' },
       signal: AbortSignal.timeout(15000)
     });
-    const xmlText = await r2.text();
-    console.log('[NF] GET XML status:', r2.status, '| inicio:', xmlText.slice(0, 60));
+    const xmlRaw = await r2.text();
+    console.log('[NF] GET XML status:', r2.status, '| inicio:', xmlRaw.slice(0, 80));
 
-    if (!r2.ok) return res.status(r2.status).json({ error: 'Erro ao baixar XML: ' + xmlText.slice(0, 200) });
+    if (!r2.ok) return res.status(r2.status).json({ error: 'Erro ao baixar XML: ' + xmlRaw.slice(0, 200) });
 
-    res.set('Content-Type', 'application/xml; charset=utf-8');
-    return res.send(xmlText);
+    // Resposta pode ser XML direto ou JSON com o arquivo dentro
+    if (xmlRaw.trim().startsWith('<')) {
+      res.set('Content-Type', 'application/xml; charset=utf-8');
+      return res.send(xmlRaw);
+    }
+
+    // Parsear JSON retornado pelo endpoint
+    try {
+      const jsonXml = JSON.parse(xmlRaw);
+      console.log('[NF] JSON keys:', Object.keys(jsonXml).join(', '));
+
+      // Tenta extrair XML de campos comuns
+      const campos = ['xml', 'content', 'conteudo', 'data', 'file', 'body', 'xmlContent', 'xmlNFe'];
+      let xmlFinal = null;
+      for (const campo of campos) {
+        if (jsonXml[campo]) {
+          const val = String(jsonXml[campo]);
+          // Pode ser XML direto ou base64
+          if (val.trim().startsWith('<')) { xmlFinal = val; break; }
+          try {
+            const dec = Buffer.from(val, 'base64').toString('utf-8');
+            if (dec.trim().startsWith('<')) { xmlFinal = dec; break; }
+          } catch {}
+        }
+      }
+
+      if (xmlFinal) {
+        res.set('Content-Type', 'application/xml; charset=utf-8');
+        return res.send(xmlFinal);
+      }
+
+      // Se nao achou o campo, loga o JSON completo para debug e retorna erro
+      console.log('[NF] JSON completo:', JSON.stringify(jsonXml).slice(0, 500));
+      return res.status(400).json({
+        error: 'XML nao encontrado na resposta. Campos: ' + Object.keys(jsonXml).join(', '),
+        amostra: JSON.stringify(jsonXml).slice(0, 300)
+      });
+    } catch (e) {
+      console.log('[NF] Nao e JSON nem XML:', xmlRaw.slice(0, 200));
+      return res.status(400).json({ error: 'Formato de resposta desconhecido: ' + xmlRaw.slice(0, 100) });
+    }
 
   } catch (e) {
     console.error('[NF] Excecao:', e.message);
